@@ -12,7 +12,9 @@ runs/
 
 # ── Compiled C artifacts ────────────────────────────────────────────────────
 src/kernel.so
+src/kernel.dll
 src/kernel_test
+src/kernel_test.exe
 
 # ── Python ──────────────────────────────────────────────────────────────────
 __pycache__/

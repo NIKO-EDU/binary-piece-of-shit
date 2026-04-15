@@ -8,10 +8,12 @@ Exposes:
 
 import ctypes
 import os
+import sys
 import numpy as np
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-_LIB_PATH = os.path.join(_HERE, "kernel.so")
+_LIB_NAME = "kernel.dll" if sys.platform == "win32" else "kernel.so"
+_LIB_PATH = os.path.join(_HERE, _LIB_NAME)
 
 _lib = None
 
@@ -21,7 +23,7 @@ def _load():
     if _lib is None:
         if not os.path.exists(_LIB_PATH):
             raise FileNotFoundError(
-                f"kernel.so not found at {_LIB_PATH}. Run `make` first."
+                f"{_LIB_NAME} not found at {_LIB_PATH}. Run `make` first."
             )
         _lib = ctypes.CDLL(_LIB_PATH)
 

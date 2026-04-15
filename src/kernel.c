@@ -2,11 +2,13 @@
  * kernel.c — XNOR-Popcount and Sobel convolution kernels
  *
  * Compile as shared library:
- *   gcc -O3 -march=native -shared -fPIC -lm -o kernel.so kernel.c
+ *   Linux:   gcc -O3 -march=native -fopenmp -shared -fPIC -lm -o kernel.so kernel.c
+ *   Windows: gcc -O3 -march=native -fopenmp -shared -lm -o kernel.dll kernel.c
  *
- * Compile for tests (ASAN + UBSan):
- *   gcc -O1 -g -fsanitize=address,undefined -Wall -Wextra -lm \
- *       -o kernel_test kernel.c -DKERNEL_TEST_MAIN
+ * Compile for tests:
+ *   Linux:   gcc -O1 -g -fsanitize=address,undefined -Wall -Wextra -lm \
+ *                -o kernel_test kernel.c -DKERNEL_TEST_MAIN
+ *   Windows: gcc -O1 -g -Wall -Wextra -lm -o kernel_test.exe kernel.c -DKERNEL_TEST_MAIN
  */
 
 #include <stdint.h>
@@ -17,6 +19,12 @@
 #include <stdlib.h>
 #ifdef _OPENMP
 #include <omp.h>
+#endif
+
+#ifdef _WIN32
+#  define KERNEL_EXPORT __declspec(dllexport)
+#else
+#  define KERNEL_EXPORT
 #endif
 
 /* --------------------------------------------------------------------------
@@ -40,7 +48,7 @@
  *   agree = ((input_bit > 0) == (weight > 0)) ? 1 : 0
  *   output = 2 * popcount - kH*kW   maps to [-kH*kW, +kH*kW]
  * -------------------------------------------------------------------------- */
-int xnor_popcount_conv(
+KERNEL_EXPORT int xnor_popcount_conv(
     const uint8_t *input,
     const int8_t  *weights,
     int32_t       *output,
@@ -107,7 +115,7 @@ int xnor_popcount_conv(
  * Returns 0 on success, -1 on invalid arguments.
  * Zero-padding used for border pixels.
  * -------------------------------------------------------------------------- */
-int sobel_conv(
+KERNEL_EXPORT int sobel_conv(
     const uint8_t *input,
     float         *output,
     int rows, int cols)
@@ -164,7 +172,7 @@ int sobel_conv(
  * Returns 0 on success, −1 on invalid arguments.
  * Zero-padding for out-of-bounds positions.
  * -------------------------------------------------------------------------- */
-int xnor_packed_u8_conv(
+KERNEL_EXPORT int xnor_packed_u8_conv(
     const uint8_t *input,
     const uint8_t *weights,
     int32_t       *output,
@@ -217,7 +225,7 @@ int xnor_packed_u8_conv(
  * Identical semantics to xnor_packed_u8_conv; one __builtin_popcountll call
  * processes 64 channels in a single instruction.
  * -------------------------------------------------------------------------- */
-int xnor_packed_u64_conv(
+KERNEL_EXPORT int xnor_packed_u64_conv(
     const uint64_t *input,
     const uint64_t *weights,
     int32_t        *output,
@@ -281,7 +289,7 @@ int xnor_packed_u64_conv(
  *
  * Returns 0 on success, -1 on invalid arguments.
  * -------------------------------------------------------------------------- */
-int xnor_multi_filter_conv(
+KERNEL_EXPORT int xnor_multi_filter_conv(
     const uint64_t *input,
     const uint64_t *weights,
     int32_t        *output,
@@ -354,7 +362,7 @@ int xnor_multi_filter_conv(
  *           weights[ch * kH*kW + kr*kW + kc]
  * output  : [rows × cols] float32
  * -------------------------------------------------------------------------- */
-int float32_conv_nch_u8(
+KERNEL_EXPORT int float32_conv_nch_u8(
     const uint8_t *input,
     const float   *weights,
     float         *output,
@@ -405,7 +413,7 @@ int float32_conv_nch_u8(
  * Float32 reference for xnor_packed_u64_conv.
  * Same packed uint64 input; unpacks each of the n_ch bits to ±1 float.
  * -------------------------------------------------------------------------- */
-int float32_conv_nch_u64(
+KERNEL_EXPORT int float32_conv_nch_u64(
     const uint64_t *input,
     const float    *weights,
     float          *output,
@@ -464,7 +472,7 @@ int float32_conv_nch_u64(
  *
  * Returns 0 on success, -1 on invalid arguments.
  * -------------------------------------------------------------------------- */
-int pack_channels_to_u64(
+KERNEL_EXPORT int pack_channels_to_u64(
     const uint8_t *planes,
     uint64_t      *output,
     int n_ch,
@@ -501,7 +509,7 @@ int pack_channels_to_u64(
  *
  * Returns 0 on success, -1 on invalid arguments.
  * -------------------------------------------------------------------------- */
-int threshold_i32_to_u8(
+KERNEL_EXPORT int threshold_i32_to_u8(
     const int32_t *scores,
     uint8_t       *output,
     int n,
