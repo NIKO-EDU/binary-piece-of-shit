@@ -1,0 +1,28 @@
+# SOD-OPT dependencies
+#
+# PyTorch — install BEFORE the rest, choosing the right CUDA build for your GPU.
+# Find the correct command at https://pytorch.org/get-started/locally/
+# Examples:
+#   CUDA 12.1:  pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+#   CUDA 11.8:  pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
+#   CPU only:   pip install torch torchvision
+#
+# After installing torch, run:  pip install -r requirements.txt
+
+torch>=2.1.0
+torchvision>=0.16.0
+
+# Object detection head + loss function
+ultralytics==8.4.37
+
+# Image processing
+Pillow>=10.0.0
+
+# Numerical computing
+numpy>=1.24.0
+
+# Scientific utilities (used in some benchmark scripts)
+scipy>=1.11.0
+
+# YOLO ONNX baseline benchmark
+onnxruntime>=1.16.0
