@@ -42,3 +42,5 @@ Thumbs.db
 # ── Jupyter ─────────────────────────────────────────────────────────────────
 .ipynb_checkpoints/
 *.ipynb
+
+CLAUDE.md
