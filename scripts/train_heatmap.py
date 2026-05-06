@@ -5,32 +5,32 @@ Usage
 -----
     python3 scripts/train_heatmap.py [--epochs N] [--batch B] [--lr LR]
                                      [--max-samples N] [--device cpu|cuda]
-                                     [--img-dir PATH] [--ann-dir PATH] [--run-dir PATH]
+                                     [--img-dir PATH] [--ann-dir PATH]
+                                     [--run-dir PATH] [--cache-dir PATH]
+                                     [--label-format visdrone|yolo]
 
-What this does
---------------
-1. Loads VisDrone images, converts to grayscale, extracts top-4 MSB planes.
-2. Builds Gaussian GT heatmaps from bounding-box annotations.
-3. Trains HeatmapScreener with weighted BCE loss.
-4. Logs per-epoch loss and recall (fraction of annotated centers in heatmap > 0.5).
-5. Saves checkpoints to runs/heatmap_train/.
+GT heatmap
+----------
+Each bounding box is drawn as a filled rectangle (1.0) on the 80×80 target map.
+Any pixel inside the box is a positive target — covering 80% of a box earns 80%
+of the maximum reward. Overlapping boxes are merged with np.maximum.
 
-VisDrone annotation format (per line)
---------------------------------------
-  x1, y1, w, h, score, category_id, truncation, occlusion
-  - score=0 → ignored region, skip
-  - category_id: 0=ignore, 1-10=valid, 11=others (skip)
+If --cache-dir is given, grayscale images and heatmaps are saved to .npy on first
+pass and loaded from disk on all subsequent epochs. Epoch 1 is slower; epochs 2-30
+skip all JPEG/annotation processing.
 
-GT heatmap generation
----------------------
-For each valid bbox, a Gaussian blob is stamped onto an 80×80 float32 target map.
-Sigma = max(1.0, sqrt(w80 * h80) / 4) where w80, h80 are bbox dimensions at 80×80 scale.
+Metrics
+-------
+soft_cov  : sum(pred * gt) / sum(gt)  — primary; avg predicted prob inside GT boxes
+recall@0.5: fraction of GT-positive pixels where pred > 0.5  — secondary
+Both computed in a single forward pass every 10 epochs.
 """
 
 import argparse
-import math
+import sys
 import time
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import torch
@@ -38,7 +38,6 @@ import torch.nn as nn
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 
-import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 from heatmap_model import HeatmapScreener, extract_msb_planes
 
@@ -49,21 +48,8 @@ _DEFAULT_RUN = ROOT / "runs" / "heatmap_train"
 
 VALID_CATS  = set(range(1, 11))
 IMG_SIZE    = 640
-HEATMAP_OUT = 80          # output spatial resolution
-N_MSB       = 4           # top-4 bit-planes: bits 7,6,5,4
-
-
-# ---------------------------------------------------------------------------
-# Gaussian blob helper
-# ---------------------------------------------------------------------------
-
-def _gaussian_blob(h: int, w: int, cy: float, cx: float, sigma: float) -> np.ndarray:
-    """Return a [h, w] float32 array with a Gaussian centred at (cy, cx)."""
-    ys = np.arange(h, dtype=np.float32)
-    xs = np.arange(w, dtype=np.float32)
-    gy = np.exp(-0.5 * ((ys - cy) / sigma) ** 2)
-    gx = np.exp(-0.5 * ((xs - cx) / sigma) ** 2)
-    return np.outer(gy, gx)
+HEATMAP_OUT = 80
+N_MSB       = 4
 
 
 # ---------------------------------------------------------------------------
@@ -72,21 +58,29 @@ def _gaussian_blob(h: int, w: int, cy: float, cx: float, sigma: float) -> np.nda
 
 class HeatmapDataset(Dataset):
     """
-    Each item:
+    Returns:
       msb_planes : [N_MSB, 640, 640] float32, values {0, 1}
-      heatmap    : [1, 80, 80]       float32, values in [0, 1]
+      heatmap    : [1, 80, 80]       float32, values in {0, 1}
+                   1.0 inside any GT bounding box, 0.0 everywhere else.
 
-    label_format options
-    --------------------
-    'visdrone' : comma-separated  x1,y1,w,h,score,cat,...  (pixel coords)
-    'yolo'     : space-separated  class cx cy w h           (normalised 0-1)
+    If cache_dir is set, saves gray .npy and heatmap .npy on first access
+    and loads from disk on all subsequent calls.
+    Delete the cache directory if GT format changes.
     """
 
     def __init__(self, img_dir: Path, ann_dir: Path,
-                 max_samples: int = 0, label_format: str = "visdrone"):
+                 max_samples: int = 0,
+                 label_format: str = "visdrone",
+                 cache_dir: Optional[Path] = None):
         self.img_dir      = img_dir
         self.ann_dir      = ann_dir
         self.label_format = label_format
+        self.cache_dir    = cache_dir
+
+        if cache_dir is not None:
+            (cache_dir / "gray").mkdir(parents=True, exist_ok=True)
+            (cache_dir / "heatmap").mkdir(parents=True, exist_ok=True)
+
         stems = [p.stem for p in sorted(img_dir.glob("*.jpg"))]
         if max_samples:
             stems = stems[:max_samples]
@@ -96,7 +90,7 @@ class HeatmapDataset(Dataset):
         return len(self.stems)
 
     def _parse_boxes(self, ann_path: Path, orig_w: int, orig_h: int):
-        """Yield (cx80, cy80, w80, h80) for every valid box in the label file."""
+        """Yield integer (x1, y1, x2, y2) in 80×80 space for each valid box."""
         if not ann_path.exists():
             return
 
@@ -107,87 +101,100 @@ class HeatmapDataset(Dataset):
                     continue
 
                 if self.label_format == "yolo":
-                    # class cx cy w h  — already normalised to [0, 1]
                     parts = line.split()
                     if len(parts) < 5:
                         continue
-                    cx_n, cy_n, w_n, h_n = float(parts[1]), float(parts[2]), \
-                                            float(parts[3]), float(parts[4])
+                    cx_n, cy_n, w_n, h_n = (float(parts[1]), float(parts[2]),
+                                             float(parts[3]), float(parts[4]))
                     if w_n <= 0 or h_n <= 0:
                         continue
-                    yield (cx_n * HEATMAP_OUT,
-                           cy_n * HEATMAP_OUT,
-                           w_n  * HEATMAP_OUT,
-                           h_n  * HEATMAP_OUT)
+                    cx80, cy80 = cx_n * HEATMAP_OUT, cy_n * HEATMAP_OUT
+                    w80,  h80  = w_n  * HEATMAP_OUT, h_n  * HEATMAP_OUT
 
-                else:  # visdrone
-                    # x1,y1,w,h,score,cat,...  — pixel coords in original image
+                else:  # visdrone: x1,y1,w,h,score,cat,...  pixel coords
                     parts = line.split(",")
                     if len(parts) < 6:
                         continue
-                    x1, y1, bw, bh = float(parts[0]), float(parts[1]), \
-                                      float(parts[2]), float(parts[3])
-                    score = int(parts[4])
-                    cat   = int(parts[5])
-                    if score == 0 or cat not in VALID_CATS or bw <= 0 or bh <= 0:
+                    x1_, y1_, bw, bh = (float(parts[0]), float(parts[1]),
+                                        float(parts[2]), float(parts[3]))
+                    if int(parts[4]) == 0 or int(parts[5]) not in VALID_CATS:
                         continue
-                    scale_x = HEATMAP_OUT / orig_w
-                    scale_y = HEATMAP_OUT / orig_h
-                    yield ((x1 + bw / 2) * scale_x,
-                           (y1 + bh / 2) * scale_y,
-                           bw * scale_x,
-                           bh * scale_y)
+                    if bw <= 0 or bh <= 0:
+                        continue
+                    sx, sy = HEATMAP_OUT / orig_w, HEATMAP_OUT / orig_h
+                    cx80, cy80 = (x1_ + bw / 2) * sx, (y1_ + bh / 2) * sy
+                    w80,  h80  = bw * sx, bh * sy
 
-    def __getitem__(self, idx: int) -> dict:
-        stem = self.stems[idx]
+                x1 = max(0,           int(cx80 - w80 / 2))
+                y1 = max(0,           int(cy80 - h80 / 2))
+                x2 = min(HEATMAP_OUT, max(x1 + 1, round(cx80 + w80 / 2)))
+                y2 = min(HEATMAP_OUT, max(y1 + 1, round(cy80 + h80 / 2)))
+                yield x1, y1, x2, y2
 
+    def _build(self, stem: str):
+        """Compute grayscale [640,640] uint8 and heatmap [80,80] float32 from scratch."""
         pil = Image.open(self.img_dir / f"{stem}.jpg").convert("L")
         orig_w, orig_h = pil.size
         pil  = pil.resize((IMG_SIZE, IMG_SIZE), Image.LANCZOS)
         gray = np.array(pil, dtype=np.uint8)
 
-        msb     = extract_msb_planes(gray, N_MSB)
         heatmap = np.zeros((HEATMAP_OUT, HEATMAP_OUT), dtype=np.float32)
-
-        for cx80, cy80, w80, h80 in self._parse_boxes(
+        for x1, y1, x2, y2 in self._parse_boxes(
                 self.ann_dir / f"{stem}.txt", orig_w, orig_h):
-            sigma = max(1.0, math.sqrt(w80 * h80) / 4.0)
-            blob  = _gaussian_blob(HEATMAP_OUT, HEATMAP_OUT, cy80, cx80, sigma)
-            heatmap = np.maximum(heatmap, blob)
+            heatmap[y1:y2, x1:x2] = 1.0
+
+        return gray, heatmap
+
+    def __getitem__(self, idx: int) -> dict:
+        stem = self.stems[idx]
+
+        if self.cache_dir is not None:
+            gray_path    = self.cache_dir / "gray"    / f"{stem}.npy"
+            heatmap_path = self.cache_dir / "heatmap" / f"{stem}.npy"
+            if gray_path.exists() and heatmap_path.exists():
+                gray    = np.load(gray_path)
+                heatmap = np.load(heatmap_path)
+            else:
+                gray, heatmap = self._build(stem)
+                np.save(gray_path,    gray)
+                np.save(heatmap_path, heatmap)
+        else:
+            gray, heatmap = self._build(stem)
 
         return {
-            "msb_planes": torch.from_numpy(msb),
+            "msb_planes": torch.from_numpy(extract_msb_planes(gray, N_MSB)),
             "heatmap":    torch.from_numpy(heatmap).unsqueeze(0),
         }
 
 
 # ---------------------------------------------------------------------------
-# Recall metric
+# Metrics
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def compute_recall(
+def compute_metrics(
     model: HeatmapScreener,
     loader: DataLoader,
     device: torch.device,
 ) -> tuple[float, float]:
     """
-    Single pass over the dataset returning recall at thresholds 0.5 and 0.3.
+    Single forward pass returning:
+      soft_cov  : sum(pred * gt) / sum(gt)   — partial coverage, primary metric
+      recall@0.5: GT-positive pixels where pred > 0.5 / total GT-positive pixels
     """
     model.eval()
-    hits50 = hits30 = total = 0
+    soft_num = hard_num = denom = 0.0
     for batch in loader:
         planes = batch["msb_planes"].to(device)
-        gt     = batch["heatmap"].to(device)
-        pred   = model(planes)
-        gt_bin = (gt > 0.5).float()
-        hits50 += ((pred > 0.5).float() * gt_bin).sum().item()
-        hits30 += ((pred > 0.3).float() * gt_bin).sum().item()
-        total  += gt_bin.sum().item()
+        gt     = batch["heatmap"].to(device)        # [B, 1, 80, 80], values {0,1}
+        pred   = model(planes)                      # [B, 1, 80, 80], values (0,1)
+        soft_num += (pred * gt).sum().item()
+        hard_num += ((pred > 0.5) * gt).sum().item()
+        denom    += gt.sum().item()
     model.train()
-    if total == 0:
+    if denom == 0:
         return 0.0, 0.0
-    return hits50 / total, hits30 / total
+    return soft_num / denom, hard_num / denom
 
 
 # ---------------------------------------------------------------------------
@@ -195,15 +202,16 @@ def compute_recall(
 # ---------------------------------------------------------------------------
 
 def train(args):
-    device  = torch.device(args.device)
-    img_dir = Path(args.img_dir)
-    ann_dir = Path(args.ann_dir)
-    run_dir = Path(args.run_dir)
+    device    = torch.device(args.device)
+    img_dir   = Path(args.img_dir)
+    ann_dir   = Path(args.ann_dir)
+    run_dir   = Path(args.run_dir)
+    cache_dir = Path(args.cache_dir) if args.cache_dir else None
 
     model = HeatmapScreener(n_msb=N_MSB).to(device)
     print(f"HeatmapScreener parameters: {sum(p.numel() for p in model.parameters()):,}")
+    sys.stdout.flush()
 
-    # Weighted BCE: ~50× upweight positives to compensate class imbalance
     pos_weight = torch.tensor([100.0], device=device)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
@@ -213,7 +221,8 @@ def train(args):
 
     dataset = HeatmapDataset(img_dir, ann_dir,
                              max_samples=args.max_samples,
-                             label_format=args.label_format)
+                             label_format=args.label_format,
+                             cache_dir=cache_dir)
     loader  = DataLoader(
         dataset,
         batch_size=args.batch,
@@ -223,6 +232,8 @@ def train(args):
         pin_memory=(device.type == "cuda"),
     )
     print(f"Dataset: {len(dataset)} images, {len(loader)} batches/epoch")
+    if cache_dir:
+        print(f"Cache dir: {cache_dir}  (epoch 1 builds cache, later epochs load from disk)")
     sys.stdout.flush()
 
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -237,12 +248,9 @@ def train(args):
             target = batch["heatmap"].to(device)
 
             optimizer.zero_grad()
-            pred = model(planes)
-
-            # pos_weight applied only to positive pixels; background gets weight 1.0
+            pred   = model(planes)
             weight = pos_weight * target + (1.0 - target)
             loss   = nn.functional.binary_cross_entropy(pred, target, weight=weight)
-
             loss.backward()
             optimizer.step()
 
@@ -250,13 +258,13 @@ def train(args):
 
         scheduler.step()
 
-        elapsed = time.perf_counter() - t0
+        elapsed  = time.perf_counter() - t0
         avg_loss = epoch_loss / len(loader)
 
-        recall_str = ""
+        metric_str = ""
         if epoch % 10 == 0 or epoch == args.epochs:
-            r50, r30 = compute_recall(model, loader, device)
-            recall_str = f" | recall@0.5={r50:.3f} recall@0.3={r30:.3f}"
+            soft_cov, r50 = compute_metrics(model, loader, device)
+            metric_str = f" | soft_cov={soft_cov:.3f} recall@0.5={r50:.3f}"
 
         if epoch % 5 == 0 or epoch == args.epochs:
             ckpt_path = run_dir / f"epoch_{epoch:03d}.pt"
@@ -268,13 +276,11 @@ def train(args):
             print(f"  → saved {ckpt_path}")
             sys.stdout.flush()
 
-        print(
-            f"Epoch {epoch:3d}/{args.epochs} | "
-            f"loss={avg_loss:.4f}{recall_str} | {elapsed:.0f}s"
-        )
+        print(f"Epoch {epoch:3d}/{args.epochs} | loss={avg_loss:.4f}{metric_str} | {elapsed:.0f}s")
         sys.stdout.flush()
 
     print(f"\nDone. Checkpoints in {run_dir}/")
+    sys.stdout.flush()
 
 
 # ---------------------------------------------------------------------------
@@ -283,21 +289,19 @@ def train(args):
 
 def parse_args():
     p = argparse.ArgumentParser(description="Train HeatmapScreener on VisDrone")
-    p.add_argument("--epochs",      type=int,   default=30)
-    p.add_argument("--batch",       type=int,   default=8)
-    p.add_argument("--lr",          type=float, default=3e-4)
-    p.add_argument("--device",      type=str,   default="cpu")
-    p.add_argument("--max-samples", type=int,   default=0,
+    p.add_argument("--epochs",       type=int,   default=30)
+    p.add_argument("--batch",        type=int,   default=8)
+    p.add_argument("--lr",           type=float, default=3e-4)
+    p.add_argument("--device",       type=str,   default="cpu")
+    p.add_argument("--max-samples",  type=int,   default=0,
                    help="limit dataset size (0 = all)")
-    p.add_argument("--img-dir",     type=str,   default=str(_DEFAULT_IMG),
-                   help="path to images folder")
-    p.add_argument("--ann-dir",     type=str,   default=str(_DEFAULT_ANN),
-                   help="path to annotations folder")
-    p.add_argument("--run-dir",      type=str,   default=str(_DEFAULT_RUN),
-                   help="where to save checkpoints")
+    p.add_argument("--img-dir",      type=str,   default=str(_DEFAULT_IMG))
+    p.add_argument("--ann-dir",      type=str,   default=str(_DEFAULT_ANN))
+    p.add_argument("--run-dir",      type=str,   default=str(_DEFAULT_RUN))
+    p.add_argument("--cache-dir",    type=str,   default="",
+                   help="directory for preprocessed .npy cache (empty = no cache)")
     p.add_argument("--label-format", type=str,   default="visdrone",
-                   choices=["visdrone", "yolo"],
-                   help="visdrone=comma x1,y1,w,h,score,cat  yolo=space class,cx,cy,w,h normalised")
+                   choices=["visdrone", "yolo"])
     return p.parse_args()
 
 
