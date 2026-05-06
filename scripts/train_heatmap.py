@@ -205,8 +205,7 @@ def train(args):
     print(f"HeatmapScreener parameters: {sum(p.numel() for p in model.parameters()):,}")
 
     # Weighted BCE: ~50× upweight positives to compensate class imbalance
-    pos_weight = torch.tensor([50.0], device=device)
-    criterion  = nn.BCELoss(weight=pos_weight.expand(args.batch, 1, HEATMAP_OUT, HEATMAP_OUT))
+    pos_weight = torch.tensor([100.0], device=device)
 
     optimizer = torch.optim.Adam([
         {"params": model.backbone.parameters(), "lr": args.lr * 10},
@@ -242,10 +241,9 @@ def train(args):
             optimizer.zero_grad()
             pred = model(planes)
 
-            # Trim pos_weight tensor to actual batch size (last batch may be smaller)
-            bsz = pred.shape[0]
-            pw  = pos_weight.expand(bsz, 1, HEATMAP_OUT, HEATMAP_OUT)
-            loss = nn.functional.binary_cross_entropy(pred, target, weight=pw)
+            # pos_weight applied only to positive pixels; background gets weight 1.0
+            weight = pos_weight * target + (1.0 - target)
+            loss   = nn.functional.binary_cross_entropy(pred, target, weight=weight)
 
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.backbone.parameters(), max_norm=1.0)
