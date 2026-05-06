@@ -4,15 +4,16 @@ heatmap_model.py — Phase 1 screener: MSB bit-planes → object density heatmap
 Architecture
 ------------
 Input  : [B, 4, 640, 640]  float32  — top-4 MSB planes (bits 7,6,5,4), values {0,1}
-Layer 1: BinaryConv2d(4→32)  + MaxPool2d(2)  → [B, 32, 320, 320]
-Layer 2: BinaryConv2d(32→64) + MaxPool2d(2)  → [B, 64, 160, 160]
-Layer 3: BinaryConv2d(64→64) + MaxPool2d(2)  → [B, 64,  80,  80]
-Output : Conv2d(64→1, 1×1)  + Sigmoid        → [B,  1,  80,  80]
+Layer 1: Conv2d(4→32,  3×3) + BN + ReLU + MaxPool2d(2)  → [B, 32, 320, 320]
+Layer 2: Conv2d(32→64, 3×3) + BN + ReLU + MaxPool2d(2)  → [B, 64, 160, 160]
+Layer 3: Conv2d(64→64, 3×3) + BN + ReLU + MaxPool2d(2)  → [B, 64,  80,  80]
+Output : Conv2d(64→1, 1×1) + Sigmoid                    → [B,  1,  80,  80]
+
+Training uses standard float32 weights. At export, sign(weight) produces the
+±1 binary weights for XNOR-Popcount deployment in the C kernel.
 
 Each output cell covers an 8×8-pixel region of the 640×640 input.
 Output values are in [0, 1]: 0 = empty sky, 1 = dense object cluster.
-
-BinaryConv2d and the STE helpers are imported from bnn_model.py — not duplicated.
 """
 
 import sys
@@ -21,10 +22,9 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from binary_ops import BinaryConv2d
 
 
 # ---------------------------------------------------------------------------
@@ -51,13 +51,23 @@ def extract_msb_planes(img_uint8: np.ndarray, n_bits: int = 4) -> np.ndarray:
     return np.stack(planes, axis=0)
 
 
+def _conv_block(in_ch: int, out_ch: int) -> nn.Sequential:
+    return nn.Sequential(
+        nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1, bias=False),
+        nn.BatchNorm2d(out_ch),
+        nn.ReLU(inplace=True),
+        nn.MaxPool2d(2),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Model
 # ---------------------------------------------------------------------------
 
 class HeatmapScreener(nn.Module):
     """
-    Lightweight binary screener that maps MSB planes to an object density heatmap.
+    Lightweight float32 screener trained to produce object density heatmaps.
+    Weights are exported as ±1 via sign() for binary deployment.
 
     Parameters
     ----------
@@ -68,15 +78,10 @@ class HeatmapScreener(nn.Module):
         super().__init__()
 
         self.backbone = nn.Sequential(
-            BinaryConv2d(n_msb, 32, ksize=3),
-            nn.MaxPool2d(2),
-            BinaryConv2d(32, 64, ksize=3),
-            nn.MaxPool2d(2),
-            BinaryConv2d(64, 64, ksize=3),
-            nn.MaxPool2d(2),
+            _conv_block(n_msb, 32),
+            _conv_block(32, 64),
+            _conv_block(64, 64),
         )
-
-        # Float32 1×1 projection → single-channel heatmap
         self.head = nn.Conv2d(64, 1, kernel_size=1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -89,5 +94,12 @@ class HeatmapScreener(nn.Module):
         -------
         heatmap : [B, 1, H/8, W/8] float32, values in (0, 1)
         """
-        feat = self.backbone(x)
-        return torch.sigmoid(self.head(feat))
+        return torch.sigmoid(self.head(self.backbone(x)))
+
+    def export_binary_weights(self) -> list[torch.Tensor]:
+        """Return ±1 int8 weights for each Conv2d layer in the backbone."""
+        return [
+            torch.sign(m.weight).to(torch.int8).detach().cpu()
+            for m in self.backbone.modules()
+            if isinstance(m, nn.Conv2d)
+        ]

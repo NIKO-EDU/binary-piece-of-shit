@@ -170,25 +170,24 @@ def compute_recall(
     model: HeatmapScreener,
     loader: DataLoader,
     device: torch.device,
-    threshold: float = 0.5,
-) -> float:
+) -> tuple[float, float]:
     """
-    Fraction of annotated Gaussian centers that land in a predicted cell > threshold.
-    A center is "covered" if the heatmap value at its GT peak position exceeds threshold.
+    Single pass over the dataset returning recall at thresholds 0.5 and 0.3.
     """
     model.eval()
-    hits = total = 0
+    hits50 = hits30 = total = 0
     for batch in loader:
         planes = batch["msb_planes"].to(device)
-        gt     = batch["heatmap"].to(device)          # [B, 1, 80, 80]
-        pred   = model(planes)                        # [B, 1, 80, 80]
-        pred_bin = (pred > threshold).float()
-        gt_bin   = (gt  > threshold).float()
-        # count pixels where GT fires and pred also fires
-        hits  += (pred_bin * gt_bin).sum().item()
-        total += gt_bin.sum().item()
+        gt     = batch["heatmap"].to(device)
+        pred   = model(planes)
+        gt_bin = (gt > 0.5).float()
+        hits50 += ((pred > 0.5).float() * gt_bin).sum().item()
+        hits30 += ((pred > 0.3).float() * gt_bin).sum().item()
+        total  += gt_bin.sum().item()
     model.train()
-    return hits / total if total > 0 else 0.0
+    if total == 0:
+        return 0.0, 0.0
+    return hits50 / total, hits30 / total
 
 
 # ---------------------------------------------------------------------------
@@ -207,10 +206,7 @@ def train(args):
     # Weighted BCE: ~50× upweight positives to compensate class imbalance
     pos_weight = torch.tensor([100.0], device=device)
 
-    optimizer = torch.optim.Adam([
-        {"params": model.backbone.parameters(), "lr": args.lr * 10},
-        {"params": model.head.parameters(),     "lr": args.lr},
-    ])
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=args.epochs, eta_min=args.lr * 0.01
     )
@@ -222,10 +218,12 @@ def train(args):
         dataset,
         batch_size=args.batch,
         shuffle=True,
-        num_workers=2,
+        num_workers=4,
+        prefetch_factor=2,
         pin_memory=(device.type == "cuda"),
     )
     print(f"Dataset: {len(dataset)} images, {len(loader)} batches/epoch")
+    sys.stdout.flush()
 
     run_dir.mkdir(parents=True, exist_ok=True)
 
@@ -246,7 +244,6 @@ def train(args):
             loss   = nn.functional.binary_cross_entropy(pred, target, weight=weight)
 
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.backbone.parameters(), max_norm=1.0)
             optimizer.step()
 
             epoch_loss += loss.item()
@@ -257,9 +254,11 @@ def train(args):
         avg_loss = epoch_loss / len(loader)
 
         recall_str = ""
+        if epoch % 10 == 0 or epoch == args.epochs:
+            r50, r30 = compute_recall(model, loader, device)
+            recall_str = f" | recall@0.5={r50:.3f} recall@0.3={r30:.3f}"
+
         if epoch % 5 == 0 or epoch == args.epochs:
-            recall = compute_recall(model, loader, device)
-            recall_str = f" | recall={recall:.3f}"
             ckpt_path = run_dir / f"epoch_{epoch:03d}.pt"
             torch.save({
                 "epoch":       epoch,
@@ -267,11 +266,13 @@ def train(args):
                 "n_msb":       N_MSB,
             }, ckpt_path)
             print(f"  → saved {ckpt_path}")
+            sys.stdout.flush()
 
         print(
             f"Epoch {epoch:3d}/{args.epochs} | "
             f"loss={avg_loss:.4f}{recall_str} | {elapsed:.0f}s"
         )
+        sys.stdout.flush()
 
     print(f"\nDone. Checkpoints in {run_dir}/")
 
@@ -284,7 +285,7 @@ def parse_args():
     p = argparse.ArgumentParser(description="Train HeatmapScreener on VisDrone")
     p.add_argument("--epochs",      type=int,   default=30)
     p.add_argument("--batch",       type=int,   default=8)
-    p.add_argument("--lr",          type=float, default=1e-4)
+    p.add_argument("--lr",          type=float, default=3e-4)
     p.add_argument("--device",      type=str,   default="cpu")
     p.add_argument("--max-samples", type=int,   default=0,
                    help="limit dataset size (0 = all)")
