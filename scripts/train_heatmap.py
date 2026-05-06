@@ -5,6 +5,7 @@ Usage
 -----
     python3 scripts/train_heatmap.py [--epochs N] [--batch B] [--lr LR]
                                      [--max-samples N] [--device cpu|cuda]
+                                     [--img-dir PATH] [--ann-dir PATH] [--run-dir PATH]
 
 What this does
 --------------
@@ -41,10 +42,10 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 from heatmap_model import HeatmapScreener, extract_msb_planes
 
-ROOT    = Path(__file__).resolve().parent.parent
-IMG_DIR = ROOT / "data" / "VisDrone2019-DET-train" / "images"
-ANN_DIR = ROOT / "data" / "VisDrone2019-DET-train" / "annotations"
-RUN_DIR = ROOT / "runs" / "heatmap_train"
+ROOT         = Path(__file__).resolve().parent.parent
+_DEFAULT_IMG = ROOT / "data" / "VisDrone2019-DET-train" / "images"
+_DEFAULT_ANN = ROOT / "data" / "VisDrone2019-DET-train" / "annotations"
+_DEFAULT_RUN = ROOT / "runs" / "heatmap_train"
 
 VALID_CATS  = set(range(1, 11))
 IMG_SIZE    = 640
@@ -74,11 +75,18 @@ class HeatmapDataset(Dataset):
     Each item:
       msb_planes : [N_MSB, 640, 640] float32, values {0, 1}
       heatmap    : [1, 80, 80]       float32, values in [0, 1]
+
+    label_format options
+    --------------------
+    'visdrone' : comma-separated  x1,y1,w,h,score,cat,...  (pixel coords)
+    'yolo'     : space-separated  class cx cy w h           (normalised 0-1)
     """
 
-    def __init__(self, img_dir: Path, ann_dir: Path, max_samples: int = 0):
-        self.img_dir = img_dir
-        self.ann_dir = ann_dir
+    def __init__(self, img_dir: Path, ann_dir: Path,
+                 max_samples: int = 0, label_format: str = "visdrone"):
+        self.img_dir      = img_dir
+        self.ann_dir      = ann_dir
+        self.label_format = label_format
         stems = [p.stem for p in sorted(img_dir.glob("*.jpg"))]
         if max_samples:
             stems = stems[:max_samples]
@@ -87,51 +95,69 @@ class HeatmapDataset(Dataset):
     def __len__(self) -> int:
         return len(self.stems)
 
-    def __getitem__(self, idx: int) -> dict:
-        stem = self.stems[idx]
+    def _parse_boxes(self, ann_path: Path, orig_w: int, orig_h: int):
+        """Yield (cx80, cy80, w80, h80) for every valid box in the label file."""
+        if not ann_path.exists():
+            return
 
-        # --- Load and resize to 640×640 grayscale ---
-        pil = Image.open(self.img_dir / f"{stem}.jpg").convert("L")
-        orig_w, orig_h = pil.size
-        pil = pil.resize((IMG_SIZE, IMG_SIZE), Image.LANCZOS)
-        gray = np.array(pil, dtype=np.uint8)   # [640, 640]
+        with open(ann_path) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
 
-        msb = extract_msb_planes(gray, N_MSB)  # [4, 640, 640] float32
-
-        # --- Build GT heatmap ---
-        heatmap = np.zeros((HEATMAP_OUT, HEATMAP_OUT), dtype=np.float32)
-
-        ann_path = self.ann_dir / f"{stem}.txt"
-        if ann_path.exists():
-            scale_x = HEATMAP_OUT / orig_w
-            scale_y = HEATMAP_OUT / orig_h
-            with open(ann_path) as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
+                if self.label_format == "yolo":
+                    # class cx cy w h  — already normalised to [0, 1]
+                    parts = line.split()
+                    if len(parts) < 5:
                         continue
+                    cx_n, cy_n, w_n, h_n = float(parts[1]), float(parts[2]), \
+                                            float(parts[3]), float(parts[4])
+                    if w_n <= 0 or h_n <= 0:
+                        continue
+                    yield (cx_n * HEATMAP_OUT,
+                           cy_n * HEATMAP_OUT,
+                           w_n  * HEATMAP_OUT,
+                           h_n  * HEATMAP_OUT)
+
+                else:  # visdrone
+                    # x1,y1,w,h,score,cat,...  — pixel coords in original image
                     parts = line.split(",")
                     if len(parts) < 6:
                         continue
-                    x1, y1, bw, bh = float(parts[0]), float(parts[1]), float(parts[2]), float(parts[3])
+                    x1, y1, bw, bh = float(parts[0]), float(parts[1]), \
+                                      float(parts[2]), float(parts[3])
                     score = int(parts[4])
                     cat   = int(parts[5])
-
                     if score == 0 or cat not in VALID_CATS or bw <= 0 or bh <= 0:
                         continue
+                    scale_x = HEATMAP_OUT / orig_w
+                    scale_y = HEATMAP_OUT / orig_h
+                    yield ((x1 + bw / 2) * scale_x,
+                           (y1 + bh / 2) * scale_y,
+                           bw * scale_x,
+                           bh * scale_y)
 
-                    cx80 = (x1 + bw / 2) * scale_x
-                    cy80 = (y1 + bh / 2) * scale_y
-                    w80  = bw * scale_x
-                    h80  = bh * scale_y
-                    sigma = max(1.0, math.sqrt(w80 * h80) / 4.0)
+    def __getitem__(self, idx: int) -> dict:
+        stem = self.stems[idx]
 
-                    blob = _gaussian_blob(HEATMAP_OUT, HEATMAP_OUT, cy80, cx80, sigma)
-                    heatmap = np.maximum(heatmap, blob)
+        pil = Image.open(self.img_dir / f"{stem}.jpg").convert("L")
+        orig_w, orig_h = pil.size
+        pil  = pil.resize((IMG_SIZE, IMG_SIZE), Image.LANCZOS)
+        gray = np.array(pil, dtype=np.uint8)
+
+        msb     = extract_msb_planes(gray, N_MSB)
+        heatmap = np.zeros((HEATMAP_OUT, HEATMAP_OUT), dtype=np.float32)
+
+        for cx80, cy80, w80, h80 in self._parse_boxes(
+                self.ann_dir / f"{stem}.txt", orig_w, orig_h):
+            sigma = max(1.0, math.sqrt(w80 * h80) / 4.0)
+            blob  = _gaussian_blob(HEATMAP_OUT, HEATMAP_OUT, cy80, cx80, sigma)
+            heatmap = np.maximum(heatmap, blob)
 
         return {
             "msb_planes": torch.from_numpy(msb),
-            "heatmap":    torch.from_numpy(heatmap).unsqueeze(0),  # [1, 80, 80]
+            "heatmap":    torch.from_numpy(heatmap).unsqueeze(0),
         }
 
 
@@ -170,7 +196,10 @@ def compute_recall(
 # ---------------------------------------------------------------------------
 
 def train(args):
-    device = torch.device(args.device)
+    device  = torch.device(args.device)
+    img_dir = Path(args.img_dir)
+    ann_dir = Path(args.ann_dir)
+    run_dir = Path(args.run_dir)
 
     model = HeatmapScreener(n_msb=N_MSB).to(device)
     print(f"HeatmapScreener parameters: {sum(p.numel() for p in model.parameters()):,}")
@@ -187,7 +216,9 @@ def train(args):
         optimizer, T_max=args.epochs, eta_min=args.lr * 0.01
     )
 
-    dataset = HeatmapDataset(IMG_DIR, ANN_DIR, max_samples=args.max_samples)
+    dataset = HeatmapDataset(img_dir, ann_dir,
+                             max_samples=args.max_samples,
+                             label_format=args.label_format)
     loader  = DataLoader(
         dataset,
         batch_size=args.batch,
@@ -197,7 +228,7 @@ def train(args):
     )
     print(f"Dataset: {len(dataset)} images, {len(loader)} batches/epoch")
 
-    RUN_DIR.mkdir(parents=True, exist_ok=True)
+    run_dir.mkdir(parents=True, exist_ok=True)
 
     model.train()
     for epoch in range(1, args.epochs + 1):
@@ -231,7 +262,7 @@ def train(args):
         if epoch % 5 == 0 or epoch == args.epochs:
             recall = compute_recall(model, loader, device)
             recall_str = f" | recall={recall:.3f}"
-            ckpt_path = RUN_DIR / f"epoch_{epoch:03d}.pt"
+            ckpt_path = run_dir / f"epoch_{epoch:03d}.pt"
             torch.save({
                 "epoch":       epoch,
                 "model_state": model.state_dict(),
@@ -244,7 +275,7 @@ def train(args):
             f"loss={avg_loss:.4f}{recall_str} | {elapsed:.0f}s"
         )
 
-    print(f"\nDone. Checkpoints in {RUN_DIR}/")
+    print(f"\nDone. Checkpoints in {run_dir}/")
 
 
 # ---------------------------------------------------------------------------
@@ -259,6 +290,15 @@ def parse_args():
     p.add_argument("--device",      type=str,   default="cpu")
     p.add_argument("--max-samples", type=int,   default=0,
                    help="limit dataset size (0 = all)")
+    p.add_argument("--img-dir",     type=str,   default=str(_DEFAULT_IMG),
+                   help="path to images folder")
+    p.add_argument("--ann-dir",     type=str,   default=str(_DEFAULT_ANN),
+                   help="path to annotations folder")
+    p.add_argument("--run-dir",      type=str,   default=str(_DEFAULT_RUN),
+                   help="where to save checkpoints")
+    p.add_argument("--label-format", type=str,   default="visdrone",
+                   choices=["visdrone", "yolo"],
+                   help="visdrone=comma x1,y1,w,h,score,cat  yolo=space class,cx,cy,w,h normalised")
     return p.parse_args()
 
 
